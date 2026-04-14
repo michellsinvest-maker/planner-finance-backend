@@ -1,6 +1,5 @@
 import path from "node:path";
 import fs from "node:fs";
-import qrcode from "qrcode-terminal";
 import {
   DisconnectReason,
   fetchLatestBaileysVersion,
@@ -14,7 +13,7 @@ import { textNormalizerService } from "./text-normalizer.service";
 type WhatsAppConnectionState =
   | "idle"
   | "starting"
-  | "qr"
+  | "pairing_code"
   | "connected"
   | "disconnected"
   | "error";
@@ -25,6 +24,7 @@ interface WhatsAppStatus {
   isAuthenticated: boolean;
   hasQr: boolean;
   lastQr?: string | null;
+  lastPairingCode?: string | null;
   authPath: string;
   me?: string | null;
   lastError?: string | null;
@@ -78,12 +78,15 @@ class WhatsAppService {
   private authPath = path.resolve(process.cwd(), "auth", "baileys");
   private dueDebtTimer: NodeJS.Timeout | null = null;
   private reminderRegistry = new Map<string, string>();
+  private pairingCodeRequested = false;
+
   private status: WhatsAppStatus = {
     enabled: true,
     state: "idle",
     isAuthenticated: false,
     hasQr: false,
     lastQr: null,
+    lastPairingCode: null,
     authPath: path.resolve(process.cwd(), "auth", "baileys"),
     me: null,
     lastError: null,
@@ -102,8 +105,12 @@ class WhatsAppService {
     }
 
     this.isStarting = true;
+    this.pairingCodeRequested = false;
     this.status.state = "starting";
     this.status.lastError = null;
+    this.status.hasQr = false;
+    this.status.lastQr = null;
+    this.status.lastPairingCode = null;
 
     try {
       fs.mkdirSync(this.authPath, { recursive: true });
@@ -117,32 +124,34 @@ class WhatsAppService {
         syncFullHistory: false,
         markOnlineOnConnect: false,
         browser: ["Planner Finance", "Chrome", "1.0.0"],
+        printQRInTerminal: false,
       });
 
       this.socket.ev.on("creds.update", saveCreds);
+
+      if (!state.creds.registered) {
+        await this.requestPairingCode();
+      }
 
       this.socket.ev.on("connection.update", async (update) => {
         const { connection, qr, lastDisconnect } = update;
 
         if (qr) {
-          this.status.state = "qr";
+          this.status.state = "pairing_code";
           this.status.hasQr = true;
           this.status.lastQr = qr;
           this.status.lastError = null;
 
-          console.log("\n==================================================");
-          console.log("WHATSAPP: QR CODE GERADO");
-          console.log("Abra o WhatsApp no celular > Aparelhos conectados > Conectar um aparelho");
-          console.log("Escaneie o QR code abaixo:");
-          console.log("==================================================\n");
-
-          qrcode.generate(qr, { small: true });
+          if (!this.pairingCodeRequested) {
+            await this.requestPairingCode();
+          }
         }
 
         if (connection === "open") {
           this.status.state = "connected";
           this.status.hasQr = false;
           this.status.lastQr = null;
+          this.status.lastPairingCode = null;
           this.status.isAuthenticated = true;
           this.status.lastError = null;
           this.status.me = this.socket?.user?.id ?? null;
@@ -159,12 +168,14 @@ class WhatsAppService {
           this.status.state = "disconnected";
           this.status.isAuthenticated = false;
           this.status.me = null;
+          this.status.lastPairingCode = null;
+          this.pairingCodeRequested = false;
 
           if (statusCode === DisconnectReason.loggedOut) {
             this.status.lastError =
-              "Sessão desconectada porque o WhatsApp fez logout. Será necessário gerar QR novamente.";
+              "Sessão desconectada porque o WhatsApp fez logout. Será necessário gerar novo código de pareamento.";
             this.socket = null;
-            console.error("WHATSAPP DESLOGADO. Gere um novo QR code.");
+            console.error("WHATSAPP DESLOGADO. Gere um novo código de pareamento.");
             return;
           }
 
@@ -221,8 +232,13 @@ class WhatsAppService {
               console.log("ÁUDIO RECEBIDO DO WHATSAPP");
               console.log("Iniciando download e transcrição local...");
 
-              const audioBuffer = await this.downloadAudioBuffer(message.message!.audioMessage!);
-              const transcription = await speechToTextService.transcribeFromBuffer(audioBuffer, "ogg");
+              const audioBuffer = await this.downloadAudioBuffer(
+                message.message!.audioMessage!,
+              );
+              const transcription = await speechToTextService.transcribeFromBuffer(
+                audioBuffer,
+                "ogg",
+              );
 
               if (!transcription.ok || !transcription.text) {
                 const failAudioReply =
@@ -232,7 +248,9 @@ class WhatsAppService {
                 continue;
               }
 
-              const normalizedAudio = textNormalizerService.normalizeAll(transcription.text);
+              const normalizedAudio = textNormalizerService.normalizeAll(
+                transcription.text,
+              );
               finalText = normalizedAudio.displayText;
               transcriptionPrefix = `🎤 Áudio entendido: ${normalizedAudio.displayText}\n\n`;
 
@@ -272,13 +290,16 @@ class WhatsAppService {
               continue;
             }
 
-            const saveResult = await this.sendIncomingTextToBackend(normalizedInput.parserText);
+            const saveResult = await this.sendIncomingTextToBackend(
+              normalizedInput.parserText,
+            );
 
             console.log("RETORNO BRUTO DO BACKEND /api/messages:");
             console.dir(saveResult, { depth: null });
 
             if (!saveResult.ok) {
-              const failReply = transcriptionPrefix + this.buildInvalidFinancialReply(saveResult);
+              const failReply =
+                transcriptionPrefix + this.buildInvalidFinancialReply(saveResult);
               await this.sendText(remoteJid, failReply);
               this.status.lastReply = failReply;
               continue;
@@ -287,11 +308,7 @@ class WhatsAppService {
             const normalized = this.extractSavedData(saveResult);
             const successReply =
               transcriptionPrefix +
-              this.buildSuccessReply(
-                normalized,
-                normalizedInput.displayText,
-                saveResult
-              );
+              this.buildSuccessReply(normalized, normalizedInput.displayText, saveResult);
 
             this.status.lastSavedRecordId = normalized.id ?? null;
             this.status.lastReply = successReply;
@@ -329,7 +346,54 @@ class WhatsAppService {
       this.status.isAuthenticated = false;
       this.status.hasQr = false;
       this.status.lastQr = null;
+      this.status.lastPairingCode = null;
       this.status.me = null;
+      this.pairingCodeRequested = false;
+    }
+  }
+
+  private async requestPairingCode(): Promise<void> {
+    if (!this.socket || this.pairingCodeRequested) {
+      return;
+    }
+
+    const rawPhone =
+      process.env.WHATSAPP_PAIRING_NUMBER ||
+      process.env.WHATSAPP_PHONE_NUMBER ||
+      "";
+
+    const phoneNumber = rawPhone.replace(/\D/g, "");
+
+    if (!phoneNumber) {
+      this.status.state = "error";
+      this.status.lastError =
+        "Defina a variável WHATSAPP_PAIRING_NUMBER com seu número no formato 5511999999999.";
+      console.error(
+        "WHATSAPP: variável WHATSAPP_PAIRING_NUMBER não definida. Exemplo: 5511999999999",
+      );
+      return;
+    }
+
+    try {
+      this.pairingCodeRequested = true;
+      this.status.state = "pairing_code";
+      this.status.lastError = null;
+
+      const code = await (this.socket as any).requestPairingCode(phoneNumber);
+
+      this.status.lastPairingCode = code ?? null;
+
+      console.log("\n==================================================");
+      console.log("WHATSAPP: CÓDIGO DE PAREAMENTO GERADO");
+      console.log("No celular: WhatsApp > Aparelhos conectados > Conectar com número de telefone");
+      console.log(`Número configurado: ${phoneNumber}`);
+      console.log(`Código: ${code}`);
+      console.log("==================================================\n");
+    } catch (error: any) {
+      this.status.lastError =
+        error?.message ?? "Falha ao gerar código de pareamento.";
+      this.pairingCodeRequested = false;
+      console.error("Erro ao gerar código de pareamento:", error);
     }
   }
 
@@ -362,7 +426,8 @@ class WhatsAppService {
       return {
         ok: false,
         status: response.status,
-        error: json?.error ?? json?.message ?? "Erro ao salvar mensagem no backend.",
+        error:
+          json?.error ?? json?.message ?? "Erro ao salvar mensagem no backend.",
         ...json,
       };
     }
@@ -443,12 +508,19 @@ class WhatsAppService {
 
       if (amount === null || amount === undefined) {
         const rawAmount =
-          item.amount ?? item.parsedAmount ?? item.value ?? item.total ?? item.data?.amount ?? null;
+          item.amount ??
+          item.parsedAmount ??
+          item.value ??
+          item.total ??
+          item.data?.amount ??
+          null;
 
         amount =
           typeof rawAmount === "number"
             ? rawAmount
-            : rawAmount !== null && rawAmount !== undefined && !Number.isNaN(Number(rawAmount))
+            : rawAmount !== null &&
+                rawAmount !== undefined &&
+                !Number.isNaN(Number(rawAmount))
               ? Number(rawAmount)
               : null;
       }
@@ -458,11 +530,13 @@ class WhatsAppService {
       }
 
       if (!category) {
-        category = item.category ?? item.parsedCategory ?? item.group ?? item.data?.category ?? null;
+        category =
+          item.category ?? item.parsedCategory ?? item.group ?? item.data?.category ?? null;
       }
 
       if (!description) {
-        description = item.description ?? item.title ?? item.label ?? item.data?.description ?? null;
+        description =
+          item.description ?? item.title ?? item.label ?? item.data?.description ?? null;
       }
 
       if (!originalText) {
@@ -482,7 +556,8 @@ class WhatsAppService {
       }
 
       if (installment === null || installment === undefined) {
-        const rawInstallment = item.installment ?? item.currentInstallment ?? item.data?.installment ?? null;
+        const rawInstallment =
+          item.installment ?? item.currentInstallment ?? item.data?.installment ?? null;
         installment =
           rawInstallment !== null &&
           rawInstallment !== undefined &&
@@ -493,7 +568,10 @@ class WhatsAppService {
 
       if (totalInstallments === null || totalInstallments === undefined) {
         const rawTotalInstallments =
-          item.totalInstallments ?? item.installments ?? item.data?.totalInstallments ?? null;
+          item.totalInstallments ??
+          item.installments ??
+          item.data?.totalInstallments ??
+          null;
 
         totalInstallments =
           rawTotalInstallments !== null &&
@@ -561,14 +639,16 @@ class WhatsAppService {
   private buildSuccessReply(
     data: NormalizedSavedData,
     incomingText: string,
-    backendResponse?: SaveMessageResponse
+    backendResponse?: SaveMessageResponse,
   ): string {
     const baseText = textNormalizerService.normalizeForDisplay(
-      data.description || data.originalText || incomingText
+      data.description || data.originalText || incomingText,
     );
 
     const displayName = this.inferDisplayName(baseText);
-    const category = this.mapCategoryLabel(data.category || this.inferCategory(baseText) || "Outros");
+    const category = this.mapCategoryLabel(
+      data.category || this.inferCategory(baseText) || "Outros",
+    );
     const typeLabel = this.mapTypeLabel(data.type);
     const amountLabel = this.formatCurrency(data.amount);
     const dateLabel = this.formatDate(data.occurredAt || data.createdAt);
@@ -579,24 +659,23 @@ class WhatsAppService {
       this.inferPaymentMethod(baseText, data.type);
 
     const sourceName =
-      backendResponse?.financialImpact?.sourceName ||
-      data.sourceName ||
-      null;
+      backendResponse?.financialImpact?.sourceName || data.sourceName || null;
 
     const installment =
       backendResponse?.financialImpact?.installments ||
-      (
-        data.installment !== null &&
-        data.totalInstallments !== null &&
-        data.totalInstallments > 1
-          ? {
-              current: data.installment,
-              total: data.totalInstallments,
-            }
-          : null
-      );
+      (data.installment !== null &&
+      data.totalInstallments !== null &&
+      data.totalInstallments > 1
+        ? {
+            current: data.installment,
+            total: data.totalInstallments,
+          }
+        : null);
 
-    const paymentStatusLabel = this.mapPaymentStatusLabel(data.type, paymentMethod);
+    const paymentStatusLabel = this.mapPaymentStatusLabel(
+      data.type,
+      paymentMethod,
+    );
 
     const lines = [
       "✅ Transação criada com sucesso!",
@@ -641,9 +720,22 @@ class WhatsAppService {
     if (merchantMatch.includes("padaria")) return "Padaria";
     if (merchantMatch.includes("mercado")) return "Mercado";
     if (merchantMatch.includes("farmacia")) return "Farmácia";
-    if (merchantMatch.includes("posto") || merchantMatch.includes("gasolina") || merchantMatch.includes("combust")) return "Posto";
+    if (
+      merchantMatch.includes("posto") ||
+      merchantMatch.includes("gasolina") ||
+      merchantMatch.includes("combust")
+    ) {
+      return "Posto";
+    }
     if (merchantMatch.includes("uber")) return "Uber";
-    if (merchantMatch === "99" || merchantMatch.startsWith("99 ") || merchantMatch.endsWith(" 99") || merchantMatch.includes(" 99 ")) return "99";
+    if (
+      merchantMatch === "99" ||
+      merchantMatch.startsWith("99 ") ||
+      merchantMatch.endsWith(" 99") ||
+      merchantMatch.includes(" 99 ")
+    ) {
+      return "99";
+    }
     if (merchantMatch.includes("ifood")) return "iFood";
     if (merchantMatch.includes("academia")) return "Academia";
     if (merchantMatch.includes("aluguel")) return "Aluguel";
@@ -653,7 +745,13 @@ class WhatsAppService {
     if (merchantMatch.includes("condominio")) return "Condomínio";
 
     if (originalMatch.includes("mercado pago")) return "Mercado Pago";
-    if (originalMatch.includes("cartao nubank") || originalMatch.includes("nubank") || /\bbank\b/.test(originalMatch)) return "Cartão Nubank";
+    if (
+      originalMatch.includes("cartao nubank") ||
+      originalMatch.includes("nubank") ||
+      /\bbank\b/.test(originalMatch)
+    ) {
+      return "Cartão Nubank";
+    }
     if (originalMatch.includes("inter")) return "Inter";
     if (originalMatch.includes("picpay")) return "PicPay";
     if (originalMatch.includes("deposito")) return "Depósito";
@@ -692,7 +790,10 @@ class WhatsAppService {
       .replace(/\bcart[ãa]o de d[ée]bito\b/gi, "")
       .replace(/\bcart[ãa]o de cr[ée]dito\b/gi, "")
       .replace(/^\s*(no|na|em|de|do|da)\s+/i, "")
-      .replace(/\bque vence dia \d{1,2}(?:\/\d{1,2}(?:\/\d{2,4})?)?\b/gi, "")
+      .replace(
+        /\bque vence dia \d{1,2}(?:\/\d{1,2}(?:\/\d{2,4})?)?\b/gi,
+        "",
+      )
       .replace(/\bvence dia \d{1,2}(?:\/\d{1,2}(?:\/\d{2,4})?)?\b/gi, "")
       .replace(/\bvem esse dia \d{1,2}(?:\/\d{1,2}(?:\/\d{2,4})?)?\b/gi, "")
       .replace(/\bvem dia \d{1,2}(?:\/\d{1,2}(?:\/\d{2,4})?)?\b/gi, "")
@@ -719,10 +820,7 @@ class WhatsAppService {
       return "Alimentação";
     }
 
-    if (
-      value.includes("farmacia") ||
-      value.includes("remedio")
-    ) {
+    if (value.includes("farmacia") || value.includes("remedio")) {
       return "Saúde";
     }
 
@@ -778,7 +876,9 @@ class WhatsAppService {
     if (value.includes("pix")) return "Pix";
     if (value.includes("dinheiro") || value.includes("especie")) return "Dinheiro";
     if (value.includes("debito")) return "Débito";
-    if (value.includes("credito") || value.includes("parcelado") || value.includes("passei")) return "Crédito";
+    if (value.includes("credito") || value.includes("parcelado") || value.includes("passei")) {
+      return "Crédito";
+    }
 
     if (String(type || "").toLowerCase() === "expense") return "Débito";
     if (String(type || "").toLowerCase() === "income") return "Transferência";
@@ -839,7 +939,9 @@ class WhatsAppService {
       return null;
     }
 
-    const amountMatch = normalized.match(/\b(\d{1,3}(?:\.\d{3})*,\d{1,2}|\d+[.,]\d{1,2}|\d{1,6})\b/);
+    const amountMatch = normalized.match(
+      /\b(\d{1,3}(?:\.\d{3})*,\d{1,2}|\d+[.,]\d{1,2}|\d{1,6})\b/,
+    );
     if (!amountMatch) {
       return null;
     }
@@ -875,18 +977,26 @@ class WhatsAppService {
   }
 
   private extractDebtDueDate(text: string): string | null {
-    const explicitDateMatch = text.match(/(?:vence dia|vencimento dia|para dia|vem esse dia|vem dia|dia)\s*(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?/);
+    const explicitDateMatch = text.match(
+      /(?:vence dia|vencimento dia|para dia|vem esse dia|vem dia|dia)\s*(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?/,
+    );
     if (explicitDateMatch) {
       const day = Number(explicitDateMatch[1]);
       const month = Number(explicitDateMatch[2]);
       const year = explicitDateMatch[3]
-        ? Number(explicitDateMatch[3].length === 2 ? `20${explicitDateMatch[3]}` : explicitDateMatch[3])
+        ? Number(
+            explicitDateMatch[3].length === 2
+              ? `20${explicitDateMatch[3]}`
+              : explicitDateMatch[3],
+          )
         : new Date().getFullYear();
 
       return this.buildIsoDate(year, month, day);
     }
 
-    const dayOnlyMatch = text.match(/(?:vence dia|vencimento dia|para dia|vem esse dia|vem dia|dia)\s*(\d{1,2})\b/);
+    const dayOnlyMatch = text.match(
+      /(?:vence dia|vencimento dia|para dia|vem esse dia|vem dia|dia)\s*(\d{1,2})\b/,
+    );
     if (dayOnlyMatch) {
       const targetDay = Number(dayOnlyMatch[1]);
       const now = new Date();
@@ -976,12 +1086,13 @@ class WhatsAppService {
       totalAmount: number;
       dueDate: string | null;
     },
-    backendResponse?: SaveMessageResponse
+    backendResponse?: SaveMessageResponse,
   ) {
     const saved = backendResponse?.data || {};
     const title = saved.title || payload.title || "Conta a vencer";
     const creditor = saved.creditor || payload.creditor || null;
-    const amount = typeof saved.totalAmount === "number" ? saved.totalAmount : payload.totalAmount;
+    const amount =
+      typeof saved.totalAmount === "number" ? saved.totalAmount : payload.totalAmount;
     const dueDate = saved.dueDate || payload.dueDate;
 
     const lines = [
@@ -1039,13 +1150,16 @@ class WhatsAppService {
           title = "⚠️ Conta vence amanhã";
         }
 
-        const remainingAmount = Number(debt.totalAmount || 0) - Number(debt.amountPaid || 0);
+        const remainingAmount =
+          Number(debt.totalAmount || 0) - Number(debt.amountPaid || 0);
 
         const lines = [
           title,
           "",
           `📝 ${debt.title || "Conta a vencer"}`,
-          `💰 ${this.formatCurrency(remainingAmount > 0 ? remainingAmount : Number(debt.totalAmount || 0))}`,
+          `💰 ${this.formatCurrency(
+            remainingAmount > 0 ? remainingAmount : Number(debt.totalAmount || 0),
+          )}`,
           `📅 Vencimento: ${this.formatDate(debt.dueDate || null)}`,
         ];
 
