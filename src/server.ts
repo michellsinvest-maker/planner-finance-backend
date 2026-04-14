@@ -37,7 +37,7 @@ async function bootstrap() {
     await prisma.$connect()
 
     const port = Number(process.env.PORT || 3333)
-    const host = process.env.HOST || "127.0.0.1"
+    const host = "0.0.0.0"
 
     await app.listen({ port, host })
 
