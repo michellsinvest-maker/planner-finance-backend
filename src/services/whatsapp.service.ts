@@ -75,7 +75,7 @@ interface NormalizedSavedData {
 class WhatsAppService {
   private socket: ReturnType<typeof makeWASocket> | null = null;
   private isStarting = false;
-  private authPath = path.resolve(process.cwd(), "auth", "baileys");
+  private authPath = "/tmp/whatsapp-session";
   private dueDebtTimer: NodeJS.Timeout | null = null;
   private reminderRegistry = new Map<string, string>();
   private pairingCodeRequested = false;
