@@ -1,0 +1,90 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model FinancialMessage {
+  id                String   @id @default(cuid())
+  originalText      String
+  normalizedText    String
+  amount            Float
+  type              String
+  category          String?
+  description       String?
+  paymentMethod     String?
+  sourceType        String?
+  sourceName        String?
+  installment       Int?
+  totalInstallments Int?
+  occurredAt        DateTime?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+}
+
+model Category {
+  id        String   @id @default(cuid())
+  name      String
+  type      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Account {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  balance   Float    @default(0)
+  logo      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Card {
+  id         String   @id @default(cuid())
+  name       String   @unique
+  limit      Float    @default(0)
+  closingDay Int
+  logo       String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+model Goal {
+  id        String   @id @default(cuid())
+  title     String
+  target    Float
+  saved     Float    @default(0)
+  deadline  DateTime?
+  notes     String?
+  status    String   @default("active")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Debt {
+  id               String   @id @default(cuid())
+  title            String
+  creditor         String?
+  totalAmount      Float
+  amountPaid       Float    @default(0)
+  dueDate          DateTime?
+  status           String   @default("open")
+  notes            String?
+  notifyDaysBefore Int      @default(3)
+  lastReminderAt   DateTime?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+}
+
+model Budget {
+  id        String   @id @default(cuid())
+  category  String
+  month     Int
+  year      Int
+  planned   Float
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
