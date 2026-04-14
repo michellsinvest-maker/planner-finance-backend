@@ -1,5 +1,6 @@
 import path from "node:path";
 import fs from "node:fs";
+import qrcode from "qrcode-terminal";
 import {
   DisconnectReason,
   fetchLatestBaileysVersion,
@@ -13,7 +14,7 @@ import { textNormalizerService } from "./text-normalizer.service";
 type WhatsAppConnectionState =
   | "idle"
   | "starting"
-  | "pairing_code"
+  | "qr"
   | "connected"
   | "disconnected"
   | "error";
@@ -24,7 +25,6 @@ interface WhatsAppStatus {
   isAuthenticated: boolean;
   hasQr: boolean;
   lastQr?: string | null;
-  lastPairingCode?: string | null;
   authPath: string;
   me?: string | null;
   lastError?: string | null;
@@ -75,10 +75,12 @@ interface NormalizedSavedData {
 class WhatsAppService {
   private socket: ReturnType<typeof makeWASocket> | null = null;
   private isStarting = false;
+
+  // Sessão temporária no Render Free para evitar sessão corrompida persistente
   private authPath = "/tmp/whatsapp-session";
+
   private dueDebtTimer: NodeJS.Timeout | null = null;
   private reminderRegistry = new Map<string, string>();
-  private pairingCodeRequested = false;
 
   private status: WhatsAppStatus = {
     enabled: true,
@@ -86,8 +88,7 @@ class WhatsAppService {
     isAuthenticated: false,
     hasQr: false,
     lastQr: null,
-    lastPairingCode: null,
-    authPath: path.resolve(process.cwd(), "auth", "baileys"),
+    authPath: "/tmp/whatsapp-session",
     me: null,
     lastError: null,
     lastIncomingText: null,
@@ -105,12 +106,10 @@ class WhatsAppService {
     }
 
     this.isStarting = true;
-    this.pairingCodeRequested = false;
     this.status.state = "starting";
     this.status.lastError = null;
     this.status.hasQr = false;
     this.status.lastQr = null;
-    this.status.lastPairingCode = null;
 
     try {
       fs.mkdirSync(this.authPath, { recursive: true });
@@ -129,29 +128,28 @@ class WhatsAppService {
 
       this.socket.ev.on("creds.update", saveCreds);
 
-      if (!state.creds.registered) {
-        await this.requestPairingCode();
-      }
-
       this.socket.ev.on("connection.update", async (update) => {
         const { connection, qr, lastDisconnect } = update;
 
         if (qr) {
-          this.status.state = "pairing_code";
+          this.status.state = "qr";
           this.status.hasQr = true;
           this.status.lastQr = qr;
           this.status.lastError = null;
 
-          if (!this.pairingCodeRequested) {
-            await this.requestPairingCode();
-          }
+          console.log("\n==================================================");
+          console.log("WHATSAPP: QR CODE GERADO");
+          console.log("Abra o WhatsApp no celular > Aparelhos conectados > Conectar um aparelho");
+          console.log("Escaneie o QR code abaixo:");
+          console.log("==================================================\n");
+
+          qrcode.generate(qr, { small: true });
         }
 
         if (connection === "open") {
           this.status.state = "connected";
           this.status.hasQr = false;
           this.status.lastQr = null;
-          this.status.lastPairingCode = null;
           this.status.isAuthenticated = true;
           this.status.lastError = null;
           this.status.me = this.socket?.user?.id ?? null;
@@ -168,14 +166,12 @@ class WhatsAppService {
           this.status.state = "disconnected";
           this.status.isAuthenticated = false;
           this.status.me = null;
-          this.status.lastPairingCode = null;
-          this.pairingCodeRequested = false;
 
           if (statusCode === DisconnectReason.loggedOut) {
             this.status.lastError =
-              "Sessão desconectada porque o WhatsApp fez logout. Será necessário gerar novo código de pareamento.";
+              "Sessão desconectada porque o WhatsApp fez logout. Será necessário gerar QR novamente.";
             this.socket = null;
-            console.error("WHATSAPP DESLOGADO. Gere um novo código de pareamento.");
+            console.error("WHATSAPP DESLOGADO. Gere um novo QR code.");
             return;
           }
 
@@ -346,54 +342,7 @@ class WhatsAppService {
       this.status.isAuthenticated = false;
       this.status.hasQr = false;
       this.status.lastQr = null;
-      this.status.lastPairingCode = null;
       this.status.me = null;
-      this.pairingCodeRequested = false;
-    }
-  }
-
-  private async requestPairingCode(): Promise<void> {
-    if (!this.socket || this.pairingCodeRequested) {
-      return;
-    }
-
-    const rawPhone =
-      process.env.WHATSAPP_PAIRING_NUMBER ||
-      process.env.WHATSAPP_PHONE_NUMBER ||
-      "";
-
-    const phoneNumber = rawPhone.replace(/\D/g, "");
-
-    if (!phoneNumber) {
-      this.status.state = "error";
-      this.status.lastError =
-        "Defina a variável WHATSAPP_PAIRING_NUMBER com seu número no formato 5511999999999.";
-      console.error(
-        "WHATSAPP: variável WHATSAPP_PAIRING_NUMBER não definida. Exemplo: 5511999999999",
-      );
-      return;
-    }
-
-    try {
-      this.pairingCodeRequested = true;
-      this.status.state = "pairing_code";
-      this.status.lastError = null;
-
-      const code = await (this.socket as any).requestPairingCode(phoneNumber);
-
-      this.status.lastPairingCode = code ?? null;
-
-      console.log("\n==================================================");
-      console.log("WHATSAPP: CÓDIGO DE PAREAMENTO GERADO");
-      console.log("No celular: WhatsApp > Aparelhos conectados > Conectar com número de telefone");
-      console.log(`Número configurado: ${phoneNumber}`);
-      console.log(`Código: ${code}`);
-      console.log("==================================================\n");
-    } catch (error: any) {
-      this.status.lastError =
-        error?.message ?? "Falha ao gerar código de pareamento.";
-      this.pairingCodeRequested = false;
-      console.error("Erro ao gerar código de pareamento:", error);
     }
   }
 
