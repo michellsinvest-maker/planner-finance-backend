@@ -22,7 +22,7 @@ model FinancialMessage {
   totalInstallments Int?
   occurredAt        DateTime?
   createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
+  updatedAt         DateTime @default(now()) @updatedAt
 }
 
 model Category {
@@ -30,7 +30,7 @@ model Category {
   name      String
   type      String
   createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  updatedAt DateTime @default(now()) @updatedAt
 }
 
 model Account {
@@ -39,7 +39,7 @@ model Account {
   balance   Float    @default(0)
   logo      String?
   createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  updatedAt DateTime @default(now()) @updatedAt
 }
 
 model Card {
@@ -49,7 +49,7 @@ model Card {
   closingDay Int
   logo       String?
   createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
+  updatedAt  DateTime @default(now()) @updatedAt
 }
 
 model Goal {
@@ -61,7 +61,7 @@ model Goal {
   notes     String?
   status    String   @default("active")
   createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  updatedAt DateTime @default(now()) @updatedAt
 }
 
 model Debt {
@@ -76,7 +76,7 @@ model Debt {
   notifyDaysBefore Int      @default(3)
   lastReminderAt   DateTime?
   createdAt        DateTime @default(now())
-  updatedAt        DateTime @updatedAt
+  updatedAt        DateTime @default(now()) @updatedAt
 }
 
 model Budget {
@@ -86,5 +86,5 @@ model Budget {
   year      Int
   planned   Float
   createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  updatedAt DateTime @default(now()) @updatedAt
 }
